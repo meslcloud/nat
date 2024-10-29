@@ -33,3 +33,7 @@ systemctl status nft-forward
 tail -f /var/log/nft-forward.log
 nft list ruleset
 ```
+
+* 程序 /opt/nft-forward/
+* 配置文件 /etc/nft-forward/
+* 日志文件位 /var/log/nft-forward.log
