@@ -23,7 +23,7 @@ import time
 import threading
 import subprocess
 import logging
-import dns.resolver
+import ipaddress
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Set, Tuple
 
@@ -32,8 +32,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("/var/log/nft-forward.log"),
-        logging.StreamHandler()
+        logging.FileHandler("/var/log/nft-forward.log")
     ]
 )
 
@@ -44,156 +43,171 @@ class ForwardRule:
     remote_host: str
     last_ipv4: str = ""
     last_ipv6: str = ""
+    is_ip: bool = False
     
+    def __str__(self):
+        return f"Rule: {self.local_port} -> {self.remote_host}:{self.remote_port}"
+
+def run_cmd(cmd: str, check: bool = True) -> Tuple[bool, str]:
+    """执行shell命令并返回结果"""
+    try:
+        result = subprocess.run(cmd.split(), capture_output=True, text=True, check=check)
+        return True, result.stdout
+    except subprocess.CalledProcessError as e:
+        return False, e.stderr
+
 class PortForwardManager:
     def __init__(self, config_file: str):
         self.config_file = config_file
         self.rules: List[ForwardRule] = []
         self.running = True
         self.nft_table_name = "port_forward"
-        self.table_initialized = False
-        
-    def init_nftables(self):
-        """初始化 nftables 表和链"""
-        if self.table_initialized:
-            return
 
+    def is_valid_ip(self, addr: str) -> Tuple[bool, str]:
+        """检查是否为有效的IP地址"""
         try:
-            # 检查并删除现有的表
-            for family in ['ip', 'ip6']:
-                try:
-                    subprocess.run(f"nft list table {family} {self.nft_table_name}".split(), 
-                                 check=True, capture_output=True)
-                    subprocess.run(f"nft delete table {family} {self.nft_table_name}".split(),
-                                 check=True)
-                except subprocess.CalledProcessError:
-                    pass
+            ip = ipaddress.ip_address(addr)
+            return True, 'ipv4' if isinstance(ip, ipaddress.IPv4Address) else 'ipv6'
+        except ValueError:
+            return False, ''
 
-            # 创建新的表和链
-            commands = []
-            
-            # IPv4 表和链
-            commands.extend([
-                f"nft add table ip {self.nft_table_name}",
-                f"nft add chain ip {self.nft_table_name} prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}",
-                f"nft add chain ip {self.nft_table_name} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}"
-            ])
-            
-            # IPv6 表和链
-            commands.extend([
-                f"nft add table ip6 {self.nft_table_name}",
-                f"nft add chain ip6 {self.nft_table_name} prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}",
-                f"nft add chain ip6 {self.nft_table_name} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}"
-            ])
-
-            for cmd in commands:
-                try:
-                    subprocess.run(cmd.split(), check=True)
-                    logging.info(f"Successfully executed: {cmd}")
-                except subprocess.CalledProcessError as e:
-                    logging.error(f"Failed to initialize nftables: {e}")
-                    raise
-            
-            self.table_initialized = True
-            
-        except Exception as e:
-            logging.error(f"Failed to initialize nftables: {e}")
-            raise
-                
-    def clear_rules(self):
-        """清除所有转发规则"""
-        if not self.table_initialized:
-            return
-
-        try:
-            # 清除 IPv4 和 IPv6 规则
-            for family in ['ip', 'ip6']:
-                try:
-                    subprocess.run(f"nft flush table {family} {self.nft_table_name}".split(), check=True)
-                    subprocess.run(f"nft delete table {family} {self.nft_table_name}".split(), check=True)
-                except subprocess.CalledProcessError:
-                    pass
-            logging.info("Successfully cleared all rules and removed tables")
-            self.table_initialized = False
-        except Exception as e:
-            logging.error(f"Failed to clear rules: {e}")
-            
     def resolve_dns(self, hostname: str) -> Tuple[Optional[str], Optional[str]]:
         """解析域名为IPv4和IPv6地址"""
         ipv4 = None
         ipv6 = None
         
         try:
-            # 创建解析器
-            resolver = dns.resolver.Resolver()
-            resolver.timeout = 5
-            resolver.lifetime = 5
-            
-            # 尝试解析 IPv4 地址
+            # 直接使用socket.getaddrinfo进行解析
             try:
-                answers = resolver.resolve(hostname, 'A')
-                ipv4 = str(answers[0])
-                logging.debug(f"Resolved IPv4 for {hostname}: {ipv4}")
-            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.Timeout) as e:
-                logging.debug(f"No IPv4 address found for {hostname}: {e}")
+                addrinfo = socket.getaddrinfo(hostname, None)
+                for info in addrinfo:
+                    family, _, _, _, addr = info
+                    ip = addr[0]
+                    if family == socket.AF_INET:
+                        ipv4 = ip
+                    elif family == socket.AF_INET6:
+                        ipv6 = ip
+            except socket.gaierror as e:
+                logging.error(f"DNS resolution failed for {hostname}: {e}")
                 
-            # 尝试解析 IPv6 地址
-            try:
-                answers = resolver.resolve(hostname, 'AAAA')
-                ipv6 = str(answers[0])
-                logging.debug(f"Resolved IPv6 for {hostname}: {ipv6}")
-            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.Timeout) as e:
-                logging.debug(f"No IPv6 address found for {hostname}: {e}")
+            if ipv4:
+                logging.info(f"Resolved {hostname} to IPv4: {ipv4}")
+            if ipv6:
+                logging.info(f"Resolved {hostname} to IPv6: {ipv6}")
+            if not ipv4 and not ipv6:
+                logging.error(f"No IP addresses found for {hostname}")
                 
         except Exception as e:
-            logging.error(f"DNS resolution failed for {hostname}: {e}")
+            logging.error(f"Error resolving DNS for {hostname}: {e}")
             
         return ipv4, ipv6
-            
-    def add_forward_rules(self, rules_to_update: List[ForwardRule]):
-        """批量添加转发规则"""
-        if not self.table_initialized or not rules_to_update:
-            return
-            
-        with open('/tmp/nft_rules.txt', 'w') as f:
-            # 清除现有规则但保持表和链
-            f.write(f'flush table ip {self.nft_table_name}\n')
-            f.write(f'flush table ip6 {self.nft_table_name}\n')
-            
-            # 重新创建链
-            f.write(f'add chain ip {self.nft_table_name} prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}\n')
-            f.write(f'add chain ip {self.nft_table_name} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}\n')
-            f.write(f'add chain ip6 {self.nft_table_name} prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}\n')
-            f.write(f'add chain ip6 {self.nft_table_name} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}\n')
-            
-            # 添加所有规则
-            for rule in rules_to_update:
-                # IPv4 规则
-                if rule.last_ipv4:
-                    f.write(f'add rule ip {self.nft_table_name} prerouting tcp dport {rule.local_port} dnat to {rule.last_ipv4}:{rule.remote_port}\n')
-                    f.write(f'add rule ip {self.nft_table_name} prerouting udp dport {rule.local_port} dnat to {rule.last_ipv4}:{rule.remote_port}\n')
-                    f.write(f'add rule ip {self.nft_table_name} postrouting ip daddr {rule.last_ipv4} masquerade\n')
-                    logging.info(f"Prepared IPv4 rule: {rule.local_port} -> {rule.last_ipv4}:{rule.remote_port}")
-                
-                # IPv6 规则
-                if rule.last_ipv6:
-                    f.write(f'add rule ip6 {self.nft_table_name} prerouting tcp dport {rule.local_port} dnat to [{rule.last_ipv6}]:{rule.remote_port}\n')
-                    f.write(f'add rule ip6 {self.nft_table_name} prerouting udp dport {rule.local_port} dnat to [{rule.last_ipv6}]:{rule.remote_port}\n')
-                    f.write(f'add rule ip6 {self.nft_table_name} postrouting ip6 daddr {rule.last_ipv6} masquerade\n')
-                    logging.info(f"Prepared IPv6 rule: {rule.local_port} -> [{rule.last_ipv6}]:{rule.remote_port}")
-                
+
+    def delete_tables(self):
+        """删除现有的表（忽略错误）"""
+        for family in ['ip', 'ip6']:
+            cmd = f'nft delete table {family} {self.nft_table_name}'
+            run_cmd(cmd, check=False)
+
+    def create_tables(self) -> bool:
+        """创建表和基本链"""
+        nft_rules = f'''
+# 创建IPv4表和链
+add table ip {self.nft_table_name}
+add chain ip {self.nft_table_name} prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}
+add chain ip {self.nft_table_name} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}
+
+# 创建IPv6表和链
+add table ip6 {self.nft_table_name}
+add chain ip6 {self.nft_table_name} prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}
+add chain ip6 {self.nft_table_name} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}
+'''
+        rules_file = '/tmp/nft_create_tables.txt'
         try:
-            subprocess.run(['nft', '-f', '/tmp/nft_rules.txt'], check=True)
-            logging.info("Successfully applied all rules")
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Failed to apply rules: {e}")
+            with open(rules_file, 'w') as f:
+                f.write(nft_rules)
+            success, output = run_cmd(f'nft -f {rules_file}')
+            if not success:
+                logging.error(f"Failed to create tables: {output}")
+            return success
         finally:
-            os.remove('/tmp/nft_rules.txt')
+            if os.path.exists(rules_file):
+                os.remove(rules_file)
+
+    def add_port_rules(self) -> bool:
+        """添加端口转发规则"""
+        if not self.rules:
+            return True
+
+        nft_rules = []
+        for rule in self.rules:
+            # IPv4 规则
+            if rule.last_ipv4:
+                nft_rules.extend([
+                    f'add rule ip {self.nft_table_name} prerouting tcp dport {rule.local_port} dnat to {rule.last_ipv4}:{rule.remote_port}',
+                    f'add rule ip {self.nft_table_name} prerouting udp dport {rule.local_port} dnat to {rule.last_ipv4}:{rule.remote_port}',
+                    f'add rule ip {self.nft_table_name} postrouting ip daddr {rule.last_ipv4} masquerade'
+                ])
+                logging.info(f"Prepared IPv4 rule: {rule.local_port} -> {rule.last_ipv4}:{rule.remote_port}")
+
+            # IPv6 规则
+            if rule.last_ipv6:
+                nft_rules.extend([
+                    f'add rule ip6 {self.nft_table_name} prerouting tcp dport {rule.local_port} dnat to [{rule.last_ipv6}]:{rule.remote_port}',
+                    f'add rule ip6 {self.nft_table_name} prerouting udp dport {rule.local_port} dnat to [{rule.last_ipv6}]:{rule.remote_port}',
+                    f'add rule ip6 {self.nft_table_name} postrouting ip6 daddr {rule.last_ipv6} masquerade'
+                ])
+                logging.info(f"Prepared IPv6 rule: {rule.local_port} -> [{rule.last_ipv6}]:{rule.remote_port}")
+
+        if not nft_rules:
+            return True
+
+        rules_file = '/tmp/nft_port_rules.txt'
+        try:
+            with open(rules_file, 'w') as f:
+                f.write('\n'.join(nft_rules) + '\n')
+            success, output = run_cmd(f'nft -f {rules_file}')
+            if not success:
+                logging.error(f"Failed to add port rules: {output}")
+            return success
+        finally:
+            if os.path.exists(rules_file):
+                os.remove(rules_file)
+
+    def update_forward_rules(self) -> bool:
+        """更新所有转发规则"""
+        logging.info("Updating forwarding rules...")
+        
+        # 解析所有域名
+        for rule in self.rules:
+            if not rule.is_ip:  # 只处理域名规则
+                ipv4, ipv6 = self.resolve_dns(rule.remote_host)
+                if ipv4:
+                    rule.last_ipv4 = ipv4
+                if ipv6:
+                    rule.last_ipv6 = ipv6
+        
+        # 删除现有表（忽略错误）
+        self.delete_tables()
+        
+        # 创建新表和链
+        if not self.create_tables():
+            return False
             
+        # 添加端口转发规则
+        if not self.add_port_rules():
+            return False
+            
+        logging.info("Successfully updated all forwarding rules")
+        return True
+
     def load_config(self):
         """加载配置文件"""
         self.rules.clear()
         
+        if not os.path.exists(self.config_file):
+            logging.error(f"Config file not found: {self.config_file}")
+            return
+            
         try:
             with open(self.config_file, 'r') as f:
                 for line in f:
@@ -203,55 +217,79 @@ class PortForwardManager:
                         
                     parts = line.split(',')
                     if len(parts) == 4 and parts[0] == 'SINGLE':
-                        local_port = int(parts[1])
-                        remote_port = int(parts[2])
-                        remote_host = parts[3]
-                        
-                        self.rules.append(ForwardRule(
-                            local_port=local_port,
-                            remote_port=remote_port,
-                            remote_host=remote_host
-                        ))
+                        try:
+                            local_port = int(parts[1])
+                            remote_port = int(parts[2])
+                            remote_host = parts[3].strip()
+                            
+                            # 检查是否是IP地址
+                            is_ip, ip_version = self.is_valid_ip(remote_host)
+                            
+                            rule = ForwardRule(
+                                local_port=local_port,
+                                remote_port=remote_port,
+                                remote_host=remote_host,
+                                is_ip=is_ip
+                            )
+                            
+                            # 如果是IP地址，直接设置
+                            if is_ip:
+                                if ip_version == 'ipv4':
+                                    rule.last_ipv4 = remote_host
+                                else:
+                                    rule.last_ipv6 = remote_host
+                                logging.info(f"Loaded IP rule: {rule}")
+                            else:
+                                logging.info(f"Loaded domain rule: {rule}")
+                            
+                            self.rules.append(rule)
+                            
+                        except ValueError as e:
+                            logging.error(f"Invalid port number in line: {line}")
                     else:
-                        logging.warning(f"Invalid config line: {line}")
+                        logging.warning(f"Skipped invalid config line: {line}")
                         
-            logging.info(f"Loaded {len(self.rules)} rules from config")
+            logging.info(f"Successfully loaded {len(self.rules)} rules from {self.config_file}")
+            
         except Exception as e:
             logging.error(f"Failed to load config: {e}")
             raise
-            
+
     def update_rules(self):
         """更新所有转发规则"""
         try:
-            self.init_nftables()
-            
-            rules_updated = False
-            for rule in self.rules:
-                ipv4, ipv6 = self.resolve_dns(rule.remote_host)
-                
-                if (ipv4 and ipv4 != rule.last_ipv4) or (ipv6 and ipv6 != rule.last_ipv6):
-                    if ipv4:
-                        rule.last_ipv4 = ipv4
-                    if ipv6:
-                        rule.last_ipv6 = ipv6
-                    rules_updated = True
-                    logging.info(f"Detected IP change for {rule.remote_host} -> IPv4: {ipv4}, IPv6: {ipv6}")
-                    
-            if rules_updated:
-                self.add_forward_rules(self.rules)
-                
+            if not self.update_forward_rules():
+                logging.error("Failed to update forward rules")
         except Exception as e:
             logging.error(f"Error updating rules: {e}")
-                
+
     def dns_monitor(self):
         """DNS监控线程"""
         while self.running:
             try:
-                self.update_rules()
+                update_needed = False
+                
+                # 检查所有域名规则
+                for rule in self.rules:
+                    if not rule.is_ip:  # 只检查域名规则
+                        ipv4, ipv6 = self.resolve_dns(rule.remote_host)
+                        if ipv4 != rule.last_ipv4 or ipv6 != rule.last_ipv6:
+                            update_needed = True
+                            if ipv4:
+                                logging.info(f"IP changed for {rule.remote_host}: {rule.last_ipv4} -> {ipv4}")
+                                rule.last_ipv4 = ipv4
+                            if ipv6:
+                                logging.info(f"IPv6 changed for {rule.remote_host}: {rule.last_ipv6} -> {ipv6}")
+                                rule.last_ipv6 = ipv6
+                
+                # 如果有IP变化，更新规则
+                if update_needed:
+                    self.update_rules()
+                    
             except Exception as e:
                 logging.error(f"Error in DNS monitor: {e}")
                 
-            time.sleep(300)  # 每5分钟检查一次DNS变化
+            time.sleep(300)  # 每5分钟检查一次
             
     def signal_handler(self, signum, frame):
         """处理信号"""
@@ -261,18 +299,25 @@ class PortForwardManager:
             
     def start(self):
         """启动端口转发管理器"""
+        logging.info("Starting port forward manager...")
+        
         signal.signal(signal.SIGTERM, self.signal_handler)
         signal.signal(signal.SIGINT, self.signal_handler)
 
         try:
             self.load_config()
-            self.update_rules()
+            if not self.rules:
+                logging.error("No valid rules loaded, exiting")
+                return
+                
+            self.update_forward_rules()
             
+            # 启动DNS监控线程
             monitor_thread = threading.Thread(target=self.dns_monitor)
             monitor_thread.daemon = True
             monitor_thread.start()
             
-            logging.info("Port forward manager started")
+            logging.info("Port forward manager is running")
             
             while self.running:
                 time.sleep(1)
@@ -286,8 +331,9 @@ class PortForwardManager:
         if not self.running:
             return
             
+        logging.info("Stopping port forward manager...")
         self.running = False
-        self.clear_rules()
+        self.delete_tables()
         logging.info("Port forward manager stopped")
         
 def main():
@@ -296,6 +342,11 @@ def main():
         sys.exit(1)
         
     config_file = "/etc/nft-forward/forward.conf"
+    
+    if not os.path.exists(config_file):
+        print(f"Config file not found: {config_file}")
+        sys.exit(1)
+        
     manager = PortForwardManager(config_file)
     manager.start()
     
