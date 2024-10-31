@@ -289,7 +289,7 @@ add chain ip6 {self.nft_table_name} postrouting {{ type nat hook postrouting pri
             except Exception as e:
                 logging.error(f"Error in DNS monitor: {e}")
                 
-            time.sleep(300)  # 每5分钟检查一次
+            time.sleep(60)  # 每1分钟检查一次
             
     def signal_handler(self, signum, frame):
         """处理信号"""
