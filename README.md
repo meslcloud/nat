@@ -1,4 +1,4 @@
-## 基于Nftables的TCP+UDP端口转发
+## 基于Python3和Nftables的TCP+UDP端口转发
 > 支持DDNS和IPV6
 * 安装python3-dnspython+Nftables：
 ```shell
