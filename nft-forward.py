@@ -12,21 +12,20 @@ import netifaces
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Set, Tuple
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("/var/log/nft-forward.log")
-    ]
-)
+def run_cmd(cmd: str, check: bool = True) -> Tuple[bool, str]:
+    """执行shell命令并返回结果"""
+    try:
+        result = subprocess.run(cmd.split(), capture_output=True, text=True, check=check)
+        return True, result.stdout
+    except subprocess.CalledProcessError as e:
+        return False, e.stderr
 
 @dataclass
 class ForwardRule:
     local_port: int
     remote_port: int
     remote_host: str
-    source_ip: str = ""  # 可选参数，为空时自动选择IP
+    source_ip: str = ""
     last_ipv4: str = ""
     last_ipv6: str = ""
     is_ip: bool = False
@@ -41,57 +40,120 @@ class PortForwardManager:
         self.rules: List[ForwardRule] = []
         self.running = True
         self.nft_table_name = "port_forward"
+        
+        # 配置日志
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler("/var/log/nft-forward.log")
+            ]
+        )
+        
         self.default_source_ips = self.get_default_ips()
         logging.info(f"Detected default source IPs: {self.default_source_ips}")
 
     def get_default_ips(self) -> Dict[str, str]:
-        """获取默认的源IP地址（IPv4和IPv6）"""
+        """获取默认的源IP地址"""
         default_ips = {'ipv4': None, 'ipv6': None}
-        
         try:
-            # 获取所有网络接口
             interfaces = netifaces.interfaces()
-            
             for iface in interfaces:
-                # 跳过回环接口
                 if iface == 'lo':
                     continue
-                    
                 addrs = netifaces.ifaddresses(iface)
-                
-                # 检查IPv4地址
                 if netifaces.AF_INET in addrs and not default_ips['ipv4']:
                     for addr in addrs[netifaces.AF_INET]:
                         ip = addr['addr']
-                        # 跳过本地链路地址
                         if not ip.startswith('169.254.'):
                             default_ips['ipv4'] = ip
                             break
-                
-                # 检查IPv6地址
                 if netifaces.AF_INET6 in addrs and not default_ips['ipv6']:
                     for addr in addrs[netifaces.AF_INET6]:
                         ip = addr['addr']
-                        # 跳过链路本地地址和临时地址
                         if not ip.startswith('fe80:'):
-                            # 移除接口标识符（如果存在）
                             ip = ip.split('%')[0]
                             default_ips['ipv6'] = ip
                             break
-                
-                if default_ips['ipv4'] and default_ips['ipv6']:
-                    break
-                    
         except Exception as e:
             logging.error(f"Error getting default IPs: {e}")
-            
         return default_ips
 
-    def get_source_ip(self, rule: ForwardRule, ip_version: str) -> str:
-        """获取源IP地址，优先使用指定的IP，否则使用默认IP"""
-        if rule.source_ip:
-            return rule.source_ip
-        return self.default_source_ips.get(ip_version)
+    def is_valid_ip(self, addr: str) -> Tuple[bool, str]:
+        """检查是否为有效的IP地址"""
+        try:
+            ip = ipaddress.ip_address(addr)
+            return True, 'ipv4' if isinstance(ip, ipaddress.IPv4Address) else 'ipv6'
+        except ValueError:
+            return False, ''
+
+    def resolve_dns(self, hostname: str) -> Tuple[Optional[str], Optional[str]]:
+        """解析域名为IPv4和IPv6地址"""
+        ipv4, ipv6 = None, None
+        try:
+            addrinfo = socket.getaddrinfo(hostname, None)
+            for info in addrinfo:
+                family, _, _, _, addr = info
+                ip = addr[0]
+                if family == socket.AF_INET:
+                    ipv4 = ip
+                elif family == socket.AF_INET6:
+                    ipv6 = ip
+        except Exception as e:
+            logging.error(f"Error resolving DNS for {hostname}: {e}")
+        return ipv4, ipv6
+
+    def delete_tables(self):
+        """删除现有的表"""
+        for family in ['ip', 'ip6']:
+            cmd = f'nft delete table {family} {self.nft_table_name}'
+            run_cmd(cmd, check=False)
+
+    def create_tables(self) -> bool:
+        """创建表和基本链"""
+        nft_rules = f'''
+add table ip {self.nft_table_name}
+add chain ip {self.nft_table_name} prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}
+add chain ip {self.nft_table_name} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}
+
+add table ip6 {self.nft_table_name}
+add chain ip6 {self.nft_table_name} prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}
+add chain ip6 {self.nft_table_name} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}
+'''
+        rules_file = '/tmp/nft_rules.txt'
+        try:
+            with open(rules_file, 'w') as f:
+                f.write(nft_rules)
+            success, output = run_cmd(f'nft -f {rules_file}')
+            if not success:
+                logging.error(f"Failed to create tables: {output}")
+            return success
+        finally:
+            if os.path.exists(rules_file):
+                os.remove(rules_file)
+
+    def update_forward_rules(self) -> bool:
+        """更新所有转发规则"""
+        logging.info("Updating forwarding rules...")
+        
+        # 解析所有域名
+        for rule in self.rules:
+            if not rule.is_ip:
+                ipv4, ipv6 = self.resolve_dns(rule.remote_host)
+                if ipv4:
+                    rule.last_ipv4 = ipv4
+                if ipv6:
+                    rule.last_ipv6 = ipv6
+        
+        # 删除现有表
+        self.delete_tables()
+        
+        # 创建新表和链
+        if not self.create_tables():
+            return False
+            
+        # 添加端口转发规则
+        return self.add_port_rules()
 
     def add_port_rules(self) -> bool:
         """添加端口转发规则"""
@@ -100,7 +162,6 @@ class PortForwardManager:
 
         nft_rules = []
         for rule in self.rules:
-            # IPv4 规则
             if rule.last_ipv4:
                 source_ip = self.get_source_ip(rule, 'ipv4')
                 if source_ip:
@@ -110,9 +171,7 @@ class PortForwardManager:
                         f'add rule ip {self.nft_table_name} postrouting ip daddr {rule.last_ipv4} tcp dport {rule.remote_port} snat to {source_ip}',
                         f'add rule ip {self.nft_table_name} postrouting ip daddr {rule.last_ipv4} udp dport {rule.remote_port} snat to {source_ip}'
                     ])
-                    logging.info(f"Prepared IPv4 rule: {rule.local_port} -> {rule.last_ipv4}:{rule.remote_port} (Source: {source_ip})")
 
-            # IPv6 规则
             if rule.last_ipv6:
                 source_ip = self.get_source_ip(rule, 'ipv6')
                 if source_ip:
@@ -122,7 +181,6 @@ class PortForwardManager:
                         f'add rule ip6 {self.nft_table_name} postrouting ip6 daddr {rule.last_ipv6} tcp dport {rule.remote_port} snat to {source_ip}',
                         f'add rule ip6 {self.nft_table_name} postrouting ip6 daddr {rule.last_ipv6} udp dport {rule.remote_port} snat to {source_ip}'
                     ])
-                    logging.info(f"Prepared IPv6 rule: {rule.local_port} -> [{rule.last_ipv6}]:{rule.remote_port} (Source: {source_ip})")
 
         if not nft_rules:
             return True
@@ -139,6 +197,12 @@ class PortForwardManager:
             if os.path.exists(rules_file):
                 os.remove(rules_file)
 
+    def get_source_ip(self, rule: ForwardRule, ip_version: str) -> str:
+        """获取源IP地址"""
+        if rule.source_ip:
+            return rule.source_ip
+        return self.default_source_ips.get(ip_version)
+        
     def load_config(self):
         """加载配置文件"""
         self.rules.clear()
