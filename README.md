@@ -1,9 +1,9 @@
 ## 基于Python3和Nftables的TCP+UDP端口转发
-> 支持DDNS和IPV6
-* 安装python3-dnspython+Nftables：
+> 支持DDNS域名，IPV6，自定义源站IP
+* 安装依赖：
 ```shell
 apt update
-apt install python3-dnspython nftables
+apt install nftables python3-dnspython python3-netifaces
 ```
 
 * 拉取nft-forward.sh：
@@ -20,7 +20,10 @@ chmod +x nft-forward.sh
 * 编辑配置文件：
 ```shell
 nano /etc/nft-forward/forward.conf
-#SINGLE,10025,10026,abc.com
+# 自动选择源IP
+SINGLE,local_port,remote_port,remote_host
+# 手动指定源IP
+SINGLE,local_port,remote_port,remote_host,source_ip
 ```
 
 * 启用：
