@@ -21,9 +21,9 @@ chmod +x nft-forward.sh
 ```shell
 nano /etc/nft-forward/forward.conf
 # 自动选择源IP
-SINGLE,local_port,remote_port,remote_host
+# SINGLE,local_port,remote_port,remote_host
 # 手动指定源IP
-SINGLE,local_port,remote_port,remote_host,source_ip
+# SINGLE,local_port,remote_port,remote_host,source_ip
 ```
 
 * 启用：
