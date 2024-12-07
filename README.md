@@ -1,6 +1,6 @@
 ## 基于Python3和Nftables的TCP+UDP端口转发
 > 支持DDNS域名，IPV6，自定义源站IP
-* 安装：
+* 拉取：
 ```shell
 wget https://raw.githubusercontent.com/meslcloud/nat/refs/heads/main/nft-install.sh
 ```
