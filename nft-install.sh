@@ -17,7 +17,7 @@ mkdir -p /opt/nft-forward
 
 # 下载Python脚本
 echo "Downloading nft-forward.py..."
-curl -o /opt/nft-forward/nft-forward.py https://rule.asndns.com/meslcloud/nat/refs/heads/main/nft-forward.py
+curl -o /opt/nft-forward/nft-forward.py https://raw.githubusercontent.com/meslcloud/nat/refs/heads/main/nft-forward.py
 
 # 设置执行权限
 chmod +x /opt/nft-forward/nft-forward.py
